@@ -1,2 +1,15 @@
 AcousticRooms/*
 .venv/*
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.pt
+*.pth
+*.ckpt
+data/
+models/*.pt
+models/*.pth
+models/*.ckpt
+readme.md
