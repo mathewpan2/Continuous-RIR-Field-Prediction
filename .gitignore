@@ -13,3 +13,5 @@ models/*.pt
 models/*.pth
 models/*.ckpt
 readme.md
+checkpoints/*
+predictions/*
