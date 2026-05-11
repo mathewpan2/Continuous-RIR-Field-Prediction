@@ -15,7 +15,7 @@ import torch
 from torch import Tensor, nn
 from torch.utils.data import DataLoader, Dataset
 
-from models import BaseModel, DepthConditionedRIRNetwork, RIRNetwork
+from models import BaseModel, DepthConditionedRIRNetwork, RIRNetwork, TraditionalWayBaseline
 
 try:
     from tqdm.auto import tqdm
@@ -31,6 +31,9 @@ DEFAULT_CHECKPOINT_DIR = Path("artifacts/checkpoints")
 DEFAULT_RANDOM_SEED = 42
 DEFAULT_SAMPLE_RATE = 22050
 DEFAULT_DEPTH_MAP_SHAPE = (256, 512)
+DEFAULT_TARGET_MODE = "early"
+DEFAULT_EARLY_MS = 80.0
+VALID_TARGET_MODES = {"full", "early"}
 
 
 @dataclass(frozen=True)
@@ -95,6 +98,14 @@ MODEL_SPECS: dict[str, ModelSpec] = {
             "depth_embedding_dim": 128,
         },
     ),
+    "traditional_way_baseline": ModelSpec(
+        name="traditional_way_baseline",
+        family="traditional_way_baseline",
+        kwargs={
+            "speed_of_sound": 343.0,
+            "reflection_gain": 0.6,
+        },
+    ),
 }
 
 
@@ -132,6 +143,51 @@ def _fit_waveform_length(rir: np.ndarray, target_length: int) -> np.ndarray:
     padded = np.zeros(target_length, dtype=np.float32)
     padded[: rir.shape[0]] = rir
     return padded
+
+
+def validate_target_mode(target_mode: str) -> str:
+    if target_mode not in VALID_TARGET_MODES:
+        raise ValueError(
+            f"target_mode must be one of {sorted(VALID_TARGET_MODES)}, got {target_mode!r}"
+        )
+    return target_mode
+
+
+def compute_early_target_length(sample_rate: int, early_ms: float = DEFAULT_EARLY_MS) -> int:
+    if sample_rate <= 0:
+        raise ValueError("sample_rate must be positive")
+    if early_ms <= 0.0:
+        raise ValueError("early_ms must be positive")
+    return int(round(float(sample_rate) * float(early_ms) / 1000.0))
+
+
+def resolve_target_shape(
+    records: Sequence[SampleRecord],
+    target_mode: str = DEFAULT_TARGET_MODE,
+    early_ms: float = DEFAULT_EARLY_MS,
+    target_length: int | None = None,
+) -> tuple[int, int]:
+    sample_rate, full_length = validate_uniform_rir_shape(records, target_length=None)
+    target_mode = validate_target_mode(target_mode)
+    if target_mode == "early":
+        return sample_rate, compute_early_target_length(sample_rate, early_ms=early_ms)
+    if target_length is not None:
+        return sample_rate, int(target_length)
+    return sample_rate, full_length
+
+
+def format_target_suffix(
+    target_mode: str = DEFAULT_TARGET_MODE,
+    early_ms: float = DEFAULT_EARLY_MS,
+) -> str:
+    target_mode = validate_target_mode(target_mode)
+    if target_mode == "full":
+        return "full"
+    if float(early_ms).is_integer():
+        early_label = str(int(early_ms))
+    else:
+        early_label = str(early_ms).replace(".", "p")
+    return f"early{early_label}ms"
 
 
 def _load_sample_metadata(metadata_path: Path) -> dict:
@@ -291,12 +347,40 @@ def cap_split_records(
     return list(records[:limit])
 
 
-class RIRDataset(Dataset[tuple[Tensor, Tensor, str]]):
-    def __init__(self, records: Sequence[SampleRecord], target_length: int) -> None:
+def estimate_room_bounds(
+    records: Sequence[SampleRecord],
+    padding: float = 0.5,
+    min_height: float = 2.5,
+) -> np.ndarray:
+    if not records:
+        raise ValueError("At least one record is required to estimate room bounds.")
+    if padding < 0.0:
+        raise ValueError("padding must be non-negative")
+    coordinates = np.asarray([record.coordinates for record in records], dtype=np.float32)
+    points = coordinates.reshape(-1, 3)
+    lower = points.min(axis=0) - float(padding)
+    upper = points.max(axis=0) + float(padding)
+    if lower[2] > 0.0:
+        lower[2] = 0.0
+    if upper[2] - lower[2] < min_height:
+        upper[2] = lower[2] + float(min_height)
+    return np.stack([lower, upper]).astype(np.float32)
+
+
+class RIRDataset(Dataset[tuple[Tensor, Tensor, Tensor, str]]):
+    def __init__(
+        self,
+        records: Sequence[SampleRecord],
+        target_length: int,
+        target_mode: str = "full",
+        early_ms: float = DEFAULT_EARLY_MS,
+    ) -> None:
         self.records = list(records)
         if not self.records:
             raise ValueError("RIRDataset requires at least one record.")
         self.target_length = int(target_length)
+        self.target_mode = validate_target_mode(target_mode)
+        self.early_ms = float(early_ms)
         self.depth_map_shape = self._infer_depth_map_shape()
 
     def _infer_depth_map_shape(self) -> tuple[int, int]:
@@ -335,16 +419,28 @@ def build_dataloader(
     batch_size: int,
     shuffle: bool,
     target_length: int,
+    target_mode: str = "full",
+    early_ms: float = DEFAULT_EARLY_MS,
 ) -> DataLoader:
     return DataLoader(
-        RIRDataset(records, target_length=target_length),
+        RIRDataset(
+            records,
+            target_length=target_length,
+            target_mode=target_mode,
+            early_ms=early_ms,
+        ),
         batch_size=batch_size,
         shuffle=shuffle,
         num_workers=0,
     )
 
 
-def create_model(model_name: str, output_dim: int) -> nn.Module:
+def create_model(
+    model_name: str,
+    output_dim: int,
+    sample_rate: int = DEFAULT_SAMPLE_RATE,
+    room_bounds: Sequence[Sequence[float]] | np.ndarray | Tensor | None = None,
+) -> nn.Module:
     if model_name not in MODEL_SPECS:
         raise KeyError(f"Unknown model name: {model_name}")
     spec = MODEL_SPECS[model_name]
@@ -356,7 +452,15 @@ def create_model(model_name: str, output_dim: int) -> nn.Module:
         return RIRNetwork(**kwargs)
     if spec.family == "rir_depth_network":
         return DepthConditionedRIRNetwork(**kwargs)
+    if spec.family == "traditional_way_baseline":
+        kwargs["sample_rate"] = sample_rate
+        kwargs["room_bounds"] = room_bounds
+        return TraditionalWayBaseline(**kwargs)
     raise ValueError(f"Unsupported model family: {spec.family}")
+
+
+def is_traditional_baseline(model_name: str) -> bool:
+    return MODEL_SPECS[model_name].family == "traditional_way_baseline"
 
 
 def forward_model(
@@ -451,13 +555,74 @@ def train_model(
     batch_size: int = 16,
     learning_rate: float = 1e-3,
     device: str = "cpu",
+    target_mode: str = DEFAULT_TARGET_MODE,
+    early_ms: float = DEFAULT_EARLY_MS,
+    sample_rate: int | None = None,
 ) -> dict[str, float | int | str]:
     checkpoint_path = Path(checkpoint_path)
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     model_start = time.perf_counter()
 
     torch_device = torch.device(device)
-    model = create_model(model_name, output_dim=output_dim).to(torch_device)
+    target_mode = validate_target_mode(target_mode)
+    room_bounds = None
+    if is_traditional_baseline(model_name):
+        room_bounds = estimate_room_bounds([*train_records, *val_records])
+    model = create_model(
+        model_name,
+        output_dim=output_dim,
+        sample_rate=sample_rate or DEFAULT_SAMPLE_RATE,
+        room_bounds=room_bounds,
+    ).to(torch_device)
+
+    if is_traditional_baseline(model_name):
+        val_loader = build_dataloader(
+            val_records,
+            batch_size=batch_size,
+            shuffle=False,
+            target_length=output_dim,
+            target_mode=target_mode,
+            early_ms=early_ms,
+        )
+        val_loss = evaluate(
+            model_name,
+            model,
+            val_loader,
+            torch_device,
+            epoch=0,
+            epochs=0,
+        )
+        torch.save(
+            {
+                "model_name": model_name,
+                "model_state_dict": model.state_dict(),
+                "output_dim": output_dim,
+                "target_mode": target_mode,
+                "early_ms": early_ms,
+                "sample_rate": sample_rate,
+                "room_bounds": room_bounds.tolist(),
+                "epoch": 0,
+                "train_loss": None,
+                "val_loss": val_loss,
+            },
+            checkpoint_path,
+        )
+        print(
+            f"[{model_name}] traditional baseline checkpoint saved "
+            f"with val_loss={val_loss:.6f}"
+        )
+        return {
+            "model_name": model_name,
+            "best_epoch": 0,
+            "best_val_loss": val_loss,
+            "checkpoint_path": str(checkpoint_path),
+            "epochs": 0,
+            "output_dim": output_dim,
+            "target_mode": target_mode,
+            "early_ms": early_ms,
+            "train_minutes": (time.perf_counter() - model_start) / 60.0,
+        }
+
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
 
     train_loader = build_dataloader(
@@ -465,12 +630,16 @@ def train_model(
         batch_size=batch_size,
         shuffle=True,
         target_length=output_dim,
+        target_mode=target_mode,
+        early_ms=early_ms,
     )
     val_loader = build_dataloader(
         val_records,
         batch_size=batch_size,
         shuffle=False,
         target_length=output_dim,
+        target_mode=target_mode,
+        early_ms=early_ms,
     )
 
     best_val_loss = float("inf")
@@ -525,6 +694,9 @@ def train_model(
                     "model_name": model_name,
                     "model_state_dict": model.state_dict(),
                     "output_dim": output_dim,
+                    "target_mode": target_mode,
+                    "early_ms": early_ms,
+                    "sample_rate": sample_rate,
                     "epoch": epoch,
                     "train_loss": train_loss,
                     "val_loss": val_loss,
@@ -548,6 +720,9 @@ def train_model(
         "best_val_loss": best_val_loss,
         "checkpoint_path": str(checkpoint_path),
         "epochs": epochs,
+        "output_dim": output_dim,
+        "target_mode": target_mode,
+        "early_ms": early_ms,
         "train_minutes": total_seconds / 60.0,
     }
 
@@ -560,7 +735,14 @@ def load_model_checkpoint(
     payload = torch.load(checkpoint_path, map_location=device)
     model_name = payload["model_name"]
     output_dim = int(payload["output_dim"])
-    model = create_model(model_name, output_dim=output_dim)
+    sample_rate = int(payload.get("sample_rate") or DEFAULT_SAMPLE_RATE)
+    room_bounds = payload.get("room_bounds")
+    model = create_model(
+        model_name,
+        output_dim=output_dim,
+        sample_rate=sample_rate,
+        room_bounds=room_bounds,
+    )
     model.load_state_dict(payload["model_state_dict"])
     model.to(torch.device(device))
     model.eval()
@@ -580,11 +762,15 @@ def export_predictions(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     model, payload = load_model_checkpoint(checkpoint_path, device=device)
     target_length = int(payload["output_dim"])
+    target_mode = validate_target_mode(str(payload.get("target_mode", "full")))
+    early_ms = float(payload.get("early_ms", DEFAULT_EARLY_MS))
     dataloader = build_dataloader(
         records,
         batch_size=batch_size,
         shuffle=False,
         target_length=target_length,
+        target_mode=target_mode,
+        early_ms=early_ms,
     )
     torch_device = torch.device(device)
 
@@ -601,6 +787,9 @@ def export_predictions(
         all_ids.extend(list(sample_ids))
 
     sample_rate, _ = validate_uniform_rir_shape(records, target_length=target_length)
+    checkpoint_sample_rate = payload.get("sample_rate")
+    if checkpoint_sample_rate is not None:
+        sample_rate = int(checkpoint_sample_rate)
     np.savez(
         output_path,
         y_true=np.concatenate(all_true, axis=0),
@@ -608,6 +797,9 @@ def export_predictions(
         sample_id=np.asarray(all_ids, dtype=object),
         method_name=np.asarray(model_name, dtype=object),
         sample_rate=np.asarray(sample_rate),
+        output_dim=np.asarray(target_length),
+        target_mode=np.asarray(target_mode, dtype=object),
+        early_ms=np.asarray(early_ms),
     )
     return output_path
 

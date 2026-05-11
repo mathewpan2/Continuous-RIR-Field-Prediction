@@ -14,18 +14,21 @@ from utils.rir_experiment import (
     DEFAULT_CHECKPOINT_DIR,
     DEFAULT_DATA_ROOT,
     DEFAULT_DEPTH_ROOT,
+    DEFAULT_EARLY_MS,
     DEFAULT_METADATA_ROOT,
+    DEFAULT_TARGET_MODE,
     cap_split_records,
     discover_samples,
+    format_target_suffix,
     prepare_runtime_environment,
     resolve_model_names,
+    resolve_target_shape,
     select_device,
     set_seed,
     split_records_by_room,
     summarize_split_sizes,
     train_model,
     validate_depth_maps_available,
-    validate_uniform_rir_shape,
 )
 
 
@@ -41,7 +44,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default=None)
-    parser.add_argument("--target-length", type=int, default=22050)
+    parser.add_argument("--target-mode", choices=("full", "early"), default=DEFAULT_TARGET_MODE)
+    parser.add_argument("--early-ms", type=float, default=DEFAULT_EARLY_MS)
+    parser.add_argument("--target-length", type=int, default=None)
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--max-train-samples", type=int, default=None)
     parser.add_argument("--max-val-samples", type=int, default=None)
@@ -61,8 +66,10 @@ def main() -> None:
         depth_root=args.depth_root,
         sample_limit=args.max_samples,
     )
-    sample_rate, output_dim = validate_uniform_rir_shape(
+    sample_rate, output_dim = resolve_target_shape(
         records,
+        target_mode=args.target_mode,
+        early_ms=args.early_ms,
         target_length=args.target_length,
     )
     splits = split_records_by_room(records, seed=args.seed)
@@ -74,16 +81,19 @@ def main() -> None:
     summaries = {
         "sample_rate": sample_rate,
         "output_dim": output_dim,
+        "target_mode": args.target_mode,
+        "early_ms": args.early_ms,
         "split_sizes": summarize_split_sizes(
             {"train": train_records, "val": val_records, "test": test_records}
         ),
         "models": [],
     }
 
+    target_suffix = format_target_suffix(args.target_mode, early_ms=args.early_ms)
     for model_name in resolve_model_names(args.models):
         if model_name == "rir_depth":
             validate_depth_maps_available([*train_records, *val_records, *test_records])
-        checkpoint_path = args.checkpoint_dir / f"{model_name}.pt"
+        checkpoint_path = args.checkpoint_dir / f"{model_name}_{target_suffix}.pt"
         result = train_model(
             model_name=model_name,
             train_records=train_records,
@@ -94,6 +104,9 @@ def main() -> None:
             batch_size=args.batch_size,
             learning_rate=args.learning_rate,
             device=device,
+            target_mode=args.target_mode,
+            early_ms=args.early_ms,
+            sample_rate=sample_rate,
         )
         summaries["models"].append(result)
 

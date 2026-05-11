@@ -1,6 +1,7 @@
 from .base_model import BaseModel
 from .depth_conditioned_rir_network import DepthConditionedRIRNetwork, DepthMapEncoder
 from .rir_network import FourierFeatureEncoding, RIRNetwork
+from .traditional_way_baseline import TraditionalWayBaseline
 
 __all__ = [
     "BaseModel",
@@ -8,4 +9,5 @@ __all__ = [
     "DepthMapEncoder",
     "FourierFeatureEncoding",
     "RIRNetwork",
+    "TraditionalWayBaseline",
 ]

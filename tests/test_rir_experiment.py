@@ -8,9 +8,13 @@ import soundfile as sf
 import torch
 
 from utils.rir_experiment import (
+    RIRDataset,
+    compute_early_target_length,
     create_model,
     discover_samples,
+    estimate_room_bounds,
     export_predictions,
+    resolve_target_shape,
     split_records_by_room,
     validate_depth_maps_available,
     validate_uniform_rir_shape,
@@ -23,6 +27,7 @@ def _write_sample(
     sample_id: str,
     waveform: np.ndarray,
     with_depth_map: bool = True,
+    sample_rate: int = 8000,
 ) -> None:
     metadata_path = base_dir / "metadata" / "Apartments_Metadata" / "Apartments" / room_id
     data_path = base_dir / "data" / "Apartments_RIR" / "Apartments" / room_id
@@ -40,7 +45,7 @@ def _write_sample(
             handle,
         )
 
-    sf.write(data_path / f"{sample_id}_hybrid_IR.wav", waveform, 8000)
+    sf.write(data_path / f"{sample_id}_hybrid_IR.wav", waveform, sample_rate)
     if with_depth_map:
         receiver_index = int(sample_id.split("_R", maxsplit=1)[1])
         np.save(depth_path / f"{receiver_index}.npy", np.ones((4, 6), dtype=np.float32))
@@ -70,6 +75,68 @@ def test_discover_samples_and_split_by_room(tmp_path: Path) -> None:
     assert records[0].depth_map_path is not None
 
 
+def test_compute_early_target_length_from_sample_rate() -> None:
+    assert compute_early_target_length(22050, early_ms=80.0) == 1764
+    assert compute_early_target_length(8000, early_ms=80.0) == 640
+
+
+def test_resolve_target_shape_uses_early_window(tmp_path: Path) -> None:
+    waveform = np.linspace(-1.0, 1.0, num=8000, dtype=np.float32)
+    for room_id in ("room_a", "room_b", "room_c"):
+        _write_sample(tmp_path, room_id, "S000_R000", waveform, sample_rate=8000)
+
+    records = discover_samples(
+        data_root=tmp_path / "data" / "Apartments_RIR" / "Apartments",
+        metadata_root=tmp_path / "metadata" / "Apartments_Metadata" / "Apartments",
+        depth_root=tmp_path / "depth_map" / "Apartments_depthmap" / "Apartments",
+    )
+
+    assert resolve_target_shape(records, target_mode="early", early_ms=80.0) == (8000, 640)
+    assert resolve_target_shape(records, target_mode="full") == (8000, 8000)
+
+
+def test_rir_dataset_returns_early_cropped_target(tmp_path: Path) -> None:
+    waveform = np.linspace(0.0, 1.0, num=10, dtype=np.float32)
+    _write_sample(tmp_path, "room_a", "S000_R000", waveform)
+    records = discover_samples(
+        data_root=tmp_path / "data" / "Apartments_RIR" / "Apartments",
+        metadata_root=tmp_path / "metadata" / "Apartments_Metadata" / "Apartments",
+        depth_root=tmp_path / "depth_map" / "Apartments_depthmap" / "Apartments",
+    )
+
+    _, _, target, _ = RIRDataset(records, target_length=4, target_mode="early")[0]
+
+    np.testing.assert_allclose(target.numpy(), waveform[:4], atol=1e-4)
+
+
+def test_rir_dataset_pads_short_early_targets(tmp_path: Path) -> None:
+    waveform = np.asarray([0.0, 0.5, 1.0], dtype=np.float32)
+    _write_sample(tmp_path, "room_a", "S000_R000", waveform)
+    records = discover_samples(
+        data_root=tmp_path / "data" / "Apartments_RIR" / "Apartments",
+        metadata_root=tmp_path / "metadata" / "Apartments_Metadata" / "Apartments",
+        depth_root=tmp_path / "depth_map" / "Apartments_depthmap" / "Apartments",
+    )
+
+    _, _, target, _ = RIRDataset(records, target_length=5, target_mode="early")[0]
+
+    np.testing.assert_allclose(target.numpy(), [0.0, 0.5, 1.0, 0.0, 0.0], atol=1e-4)
+
+
+def test_rir_dataset_preserves_full_mode_behavior(tmp_path: Path) -> None:
+    waveform = np.linspace(-1.0, 1.0, num=8, dtype=np.float32)
+    _write_sample(tmp_path, "room_a", "S000_R000", waveform)
+    records = discover_samples(
+        data_root=tmp_path / "data" / "Apartments_RIR" / "Apartments",
+        metadata_root=tmp_path / "metadata" / "Apartments_Metadata" / "Apartments",
+        depth_root=tmp_path / "depth_map" / "Apartments_depthmap" / "Apartments",
+    )
+
+    _, _, target, _ = RIRDataset(records, target_length=8, target_mode="full")[0]
+
+    np.testing.assert_allclose(target.numpy(), waveform, atol=1e-4)
+
+
 def test_create_model_supports_rir_baseline_shape() -> None:
     model = create_model("base_model", output_dim=8)
     coordinates = torch.randn(2, 6)
@@ -89,6 +156,36 @@ def test_create_model_supports_depth_conditioned_shape() -> None:
     assert output.shape == (2, 8)
 
 
+def test_create_model_supports_traditional_way_baseline_shape() -> None:
+    model = create_model(
+        "traditional_way_baseline",
+        output_dim=16,
+        sample_rate=8000,
+        room_bounds=[[-1.0, -1.0, 0.0], [2.0, 2.0, 3.0]],
+    )
+    coordinates = torch.randn(2, 6)
+
+    output = model(coordinates)
+
+    assert output.shape == (2, 16)
+
+
+def test_estimate_room_bounds_from_coordinates(tmp_path: Path) -> None:
+    waveform = np.linspace(-1.0, 1.0, num=8, dtype=np.float32)
+    _write_sample(tmp_path, "room_a", "S000_R000", waveform)
+    records = discover_samples(
+        data_root=tmp_path / "data" / "Apartments_RIR" / "Apartments",
+        metadata_root=tmp_path / "metadata" / "Apartments_Metadata" / "Apartments",
+        depth_root=tmp_path / "depth_map" / "Apartments_depthmap" / "Apartments",
+    )
+
+    bounds = estimate_room_bounds(records, padding=0.5)
+
+    assert bounds.shape == (2, 3)
+    assert np.all(bounds[1] > bounds[0])
+    assert bounds[0, 2] == 0.0
+
+
 def test_export_predictions_writes_npz_contract(tmp_path: Path) -> None:
     waveform = np.linspace(-1.0, 1.0, num=8, dtype=np.float32)
     for room_id in ("room_a", "room_b", "room_c"):
@@ -106,6 +203,9 @@ def test_export_predictions_writes_npz_contract(tmp_path: Path) -> None:
             "model_name": "rir_small",
             "model_state_dict": model.state_dict(),
             "output_dim": 8,
+            "target_mode": "early",
+            "early_ms": 80.0,
+            "sample_rate": 8000,
             "epoch": 1,
             "train_loss": 0.0,
             "val_loss": 0.0,
@@ -124,7 +224,19 @@ def test_export_predictions_writes_npz_contract(tmp_path: Path) -> None:
     )
 
     with np.load(output_path, allow_pickle=True) as data:
-        assert set(data.files) == {"method_name", "sample_id", "sample_rate", "y_pred", "y_true"}
+        assert set(data.files) == {
+            "early_ms",
+            "method_name",
+            "output_dim",
+            "sample_id",
+            "sample_rate",
+            "target_mode",
+            "y_pred",
+            "y_true",
+        }
         assert data["y_true"].shape == (3, 8)
         assert data["y_pred"].shape == (3, 8)
         assert str(data["method_name"].item()) == "rir_small"
+        assert str(data["target_mode"].item()) == "early"
+        assert float(data["early_ms"]) == 80.0
+        assert int(data["output_dim"]) == 8
